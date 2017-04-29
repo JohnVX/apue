@@ -7,10 +7,6 @@ static void sig_alrm(int);
 static sigjmp_buf jmpbuf;
 static volatile sig_atomic_t canjump;
 
-/* A `sigset_t' has a bit for each signal.  */
-
-# define _SIGSET_NWORDS	(1024 / (8 * sizeof (unsigned long int)))
-
 int main(void)
 {
 	if(signal(SIGUSR1, sig_usr1) == SIG_ERR)
