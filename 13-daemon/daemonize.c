@@ -45,3 +45,10 @@ void daemonize(const char *cmd)
 	}
 
 }
+
+int main(void)
+{
+	daemonize("hello-daemon");
+	while(1);
+	return 0;
+}
