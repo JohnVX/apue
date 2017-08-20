@@ -429,5 +429,195 @@ static char * _db_readdat(DB *db)
  */
 int db_delete(DBHANDLE h, const char *key)
 {
+	DB *db = h;
+	int rc = 0; /* assume record will be found */
+
+	if(_db_find_and_lock(db, key, 1) == 0)
+	{
+		_db_dodelete(db);
+		db->cnt_delok++;
+	}else
+	{
+		rc = -1; /* not found */
+		db->cnt_delerr++;
+	}
+	if(un_lock(db->idxfd, db->chainoff, SEEK_SET, 1) < 0)
+			err_dump("db_delete: un_lock error");
+	return rc;
+}
+
+/*
+ * Delete the current record specified by the DB structure.
+ * This function is called by db_delete and db_store, after
+ * the record has been located by _db_find_and_lock.
+ */
+static void _db_dodelete(DB *db)
+{
+	int i;
+	char *ptr;
+	off_t freeptr, saveptr;
+
+	/*
+	 * Set data buffer and key to all blanks
+	 */
+	for(ptr = db->datbuf, i = 0; i < db->datlen - 1; i++)
+			*ptr++ = SPACE;
+	*ptr = 0; /* null terminate for _db_writedat */
+	ptr = db->idxbuf;
+	while(*ptr)
+			*ptr++ = SPACE;
+
+	/*
+	 * We hava to lock the free list
+	 */
+	if(writew_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0)
+			err_dump("_db_dodelete: writew_lock error");
+
+	/*
+	 * Write the data record with all blanks
+	 */
+	_db_writedat(db, db->datbuf, db->datoff, SEEK_SET);
+
+	/*
+	 * Read the free list pointer. Its value becomes the chain 
+	 * ptr field of the deleted index record. This means the 
+	 * deleted record becomes the head of the free list.
+	 */
+	freeptr = _db_readptr(db, FREE_OFF);
+
+	/*
+	 * Save the contents of index record chain ptr,
+	 * before it's rewritten by _db_writeidx
+	 */
+	saveptr = db->ptrval;
+
+	/*
+	 * Rewrite the index record. This also rewrites the length
+	 * of the index record. The data offset, and the data length,
+	 * none of which has changed, but that's OK.
+	 */
+	_db_writeidx(db, db->idxbuf, db->idxoff, SEEK_SET, freeptr);
+
+	/*
+	 * Write the new free list pointer
+	 */
+	_db_writeptr(db, FREE_OFF, db->idxoff);
+
+	/*
+	 * Rewrite the chain ptr that pointed to this record being
+	 * deleted. Recall that _db_find_and_lock sets db->ptroff to
+	 * point to this chain ptr.We set this chain ptr to the contents
+	 * of the deleted record's chain ptr, saveptr.
+	 */
+	_db_writeptr(db, db->ptroff, saveptr);
+	if(un_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0)
+			err_dump("_db_dodelete: un_lock error");
+}
+
+/*
+ * Write a data record. called by _db_dodelete(to write the record with 
+ * blanks) and db_store
+ */
+static void _db_writedat(DB *db, const char *data, off_t offset, int whence)
+{
+	struct iovec iov[2];
+	static char newline = NEWLINE;
+
+	/*
+	 * If we're appending, we have to lock before doing the lseek and
+	 * write to make the two an atomic operation. If we're overwriting
+	 * an existing record, we don't have to lock
+	 */
+	if(whence == SEEK_END) /* we're appending, lock entire file */
+			if(writew_lock(db->datfd, 0, SEEK_SET, 0) < 0)
+					err_dump("_db_writedat: writew_lock error");
+
+	if((db->datoff = lseek(db->datfd, offset, whence)) == -1)
+			err_dump("_db_writedat: lseek error");
+	db->datlen = strlen(data) + 1; /* datlen includes newline */
+
+	iov[0].iov_base = (char *)data;
+	iov[0].iov_len = db->datlen - 1;
+	iov[1].iov_base = &newline;
+	iov[1].iov_len = 1;
+	if(writev(db->datfd, &iov[0], 2) != db->datlen)
+			err_dump("_db_writedat: writev error of data record");
+
+	if(whence == SEEK_END)
+			if(un_lock(db->datfd, 0, SEEK_SET, 0) < 0)
+					err_dump("_db_writedat: un_lock error");
+}
+
+/*
+ * Write an index record. _db_writedat is called before this function
+ * to set the datoff and datlen fields in the DB structure, which
+ * we need to write the index record
+ */
+static void _db_writeidx(DB *db, const char *key, off_t offset, int whence, off_t ptrval)
+{
+	struct iovec iov[2];
+	char asciiptrlen[PTR_SZ + IDXLEN_SZ + 1];
+	int len;
+
+	if((db->ptrval = ptrval) < 0 || ptrval > PTR_MAX)
+			err_quit("_db_writeidx: invalid ptr: %d", ptrval);
+	sprintf(db->idxbuf, "%s%c%lld%c%ld\n", key, SEP, (long long)db->datoff, SEP, (long)db->datlen);
+	len = strlen(db->idxbuf);
+	if(len < IDXLEN_MIN || len > IDXLEN_MAX)
+			err_dump("_db_writeidx: invalid length");
+	sprintf(asciiptrlen, "%*lld%*d", PTR_SZ, (long long)ptrval,IDXLEN_SZ, len);
+
+	/*
+	 * If we're appending, we have to lock before doing the lseek and
+	 * write to make the two an atomic operation. If we're overwriting 
+	 * an existing record, we don't have to lock
+	 */
+	if(whence == SEEK_END) /* we're appending */
+			if(writew_lock(db->idxfd, ((db->nhash+1)*PTR_SZ)+1, SEEK_SET, 0) < 0)
+					err_dump("_db_writeidx: writew_lock error");
+
+	/*
+	 * Position the index file and record the offset
+	 */
+	if((db->idxoff = lseek(db->idxfd, offset, whence)) == -1)
+			err_dump("_db_writeidx: lseek error");
+
+	iov[0].iov_base = asciiptrlen;
+	iov[0].iov_len = PTR_SZ + IDXLEN_SZ;
+	iov[1].iov_base = db->idxbuf;
+	iov[1].iov_len = len;
+	if(writev(db->idxfd, &iov[0], 2) != PTR_SZ + IDXLEN_SZ + len)
+			err_dump("_db_writeidx: writev error of index record");
+
+	if(whence == SEEK_END)
+			if(un_lock(db->idxfd, ((db->nhash+1)*PTR_SZ)+1, SEEK_SET, 0) < 0)
+					err_dump("_db_writeidx: un_lock error");
+	
+}
+
+/*
+ * Write a chain ptr field somewhere in the index file:
+ * the free list, the hash table, or in an index record
+ */
+static void _db_writeptr(DB *db, off_t offset, off_t ptrval)
+{
+	char asciiptr[PTR_SZ+1];
+
+	if(ptrval < 0 || ptrval > PTR_MAX)
+			err_quit("_db_writeptr: invalid ptr: %d", ptrval);
+	sprintf(asciiptr, "%*lld", PTR_SZ, (long long)ptrval);
+
+	if(lseek(db->idxfd, offset, SEEK_SET) == -1)
+			err_dump("_db_writeptr: lseek error to ptr field");
+	if(write(db->idxfd, asciiptr, PTR_SZ) != PTR_SZ)
+			err_dump("_db_writeptr: write error to ptr field");
+}
+
+/*
+ * Store a record in the database. Return 0 if OK, 1 if record exists
+ * and DB_INSERT specified, -1 on error
+ */
+int db_store(DBHANDLE h, const char *key, const char *data, int flag)
+{
 	Stay tuned ^-^
 }
